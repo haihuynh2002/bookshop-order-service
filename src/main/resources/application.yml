@@ -1,0 +1,60 @@
+server:
+  port: 9002
+  shutdown: graceful
+  netty:
+    connection-timeout: 2s
+    idle-timeout: 15s
+
+spring:
+  application:
+    name: order-service
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: http://localhost:8080/realms/PolarBookshop
+  lifecycle:
+    timeout-per-shutdown-phase: 15s
+  r2dbc:
+    username: user
+    password: password
+    url: r2dbc:postgresql://localhost:5432/bookshopdb_order
+    pool:
+      max-create-connection-time: 2s
+      initial-size: 5
+      max-size: 10
+  flyway:
+    user: ${spring.r2dbc.username}
+    password: ${spring.r2dbc.password}
+    url: jdbc:postgresql://localhost:5432/bookshopdb_order
+  cloud:
+    function:
+      definition: handleDeliveryEvent;handlePaymentEvent;handleExchangeEvent
+    stream:
+      bindings:
+        handleDeliveryEvent-in-0:
+          destination: delivery
+          group: ${spring.application.name}
+        handleExchangeEvent-in-0:
+          destination: exchange
+          group: ${spring.application.name}
+        handlePaymentEvent-in-0:
+          destination: payment
+          group: ${spring.application.name}
+        order-out-0:
+          destination: order
+      rabbit:
+        bindings:
+          acceptOrder-out-0:
+            producer:
+              transacted: true
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: user
+    password: password
+    connection-timeout: 5s
+
+
+bookshop:
+  catalog-service-uri: "http://localhost:9001"

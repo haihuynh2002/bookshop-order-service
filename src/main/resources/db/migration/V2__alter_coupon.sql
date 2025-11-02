@@ -1,0 +1,2 @@
+ALTER TABLE coupon
+ADD COLUMN created_by VARCHAR(50);
