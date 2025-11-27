@@ -8,4 +8,5 @@ import reactor.core.publisher.Mono;
 public interface OrderCouponRepository extends ReactiveCrudRepository<OrderCoupon, Long> {
     Flux<OrderCoupon> findByOrderId(Long orderId);
     Mono<Void> deleteByOrderId(Long orderId);
+    Mono<Void> deleteAllByOrderId(Long orderId);
 }

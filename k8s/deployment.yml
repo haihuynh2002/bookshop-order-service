@@ -28,6 +28,13 @@ spec:
             - name: BOOKSHOP_CATALOG_SERVICE_URI
               value: http://catalog-service
             - name: SPRING_R2DBC_URL
-              value: r2dbc:postgresql://bookshop-postgres/polardb_order
+              value: r2dbc:postgresql://bookshop-postgres/bookshopdb_order
             - name: SPRING_FLYWAY_URL
-              value: jdbc:postgresql://bookshop-postgres/polardb_order
+              value: jdbc:postgresql://bookshop-postgres/bookshopdb_order
+          volumeMounts:
+            - name: order-config-volume
+              mountPath: /workspace/config
+      volumes:
+        - name: order-config-volume
+          configMap:
+            name: order-config

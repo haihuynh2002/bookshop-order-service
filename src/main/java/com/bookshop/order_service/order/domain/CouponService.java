@@ -1,8 +1,5 @@
 package com.bookshop.order_service.order.domain;
 
-import com.bookshop.order_service.order.domain.Coupon;
-import com.bookshop.order_service.order.domain.CouponType;
-import com.bookshop.order_service.order.domain.OrderCoupon;
 import com.bookshop.order_service.order.web.CouponRequest;
 import com.bookshop.order_service.order.web.CouponResponse;
 import com.bookshop.order_service.order.web.CouponValidationRequest;
@@ -32,7 +29,7 @@ public class CouponService {
         return couponRepository.existsByCode(request.getCode())
                 .flatMap(exists -> {
                     if (exists) {
-                        return Mono.error(new RuntimeException("Coupon code already exists"));
+                        return Mono.error(new CouponAlreadyExistsException(request.getCode()));
                     }
                     Coupon coupon = couponMapper.toCoupon(request);
                     return couponRepository.save(coupon)
@@ -47,53 +44,50 @@ public class CouponService {
 
     public Mono<CouponResponse> getCouponById(Long id) {
         return couponRepository.findById(id)
-                .switchIfEmpty(Mono.error(new CouponNotFoundException("Coupon not found with id: " + id)))
+                .switchIfEmpty(Mono.error(new CouponNotFoundException(id)))
                 .map(couponMapper::toCouponResponse);
     }
 
     public Mono<CouponResponse> getCouponByCode(String code) {
         return couponRepository.findByCodeAndActiveTrue(code)
-                .switchIfEmpty(Mono.error(new CouponNotFoundException("Coupon not found with code: " + code)))
+                .switchIfEmpty(Mono.error(new CouponNotFoundException(code)))
                 .map(couponMapper::toCouponResponse);
     }
 
     public Mono<CouponResponse> updateCoupon(Long id, CouponRequest request) {
         return couponRepository.findById(id)
-                .map(coupon -> {
-                    couponMapper.update(coupon, request);
-                    return coupon;
-                })
-                .flatMap(couponRepository::save)
-                .map(couponMapper::toCouponResponse);
+                .switchIfEmpty(Mono.error(new CouponNotFoundException(id)))
+                .flatMap(existingCoupon -> {
+                    if (!existingCoupon.getCode().equals(request.getCode())) {
+                        return couponRepository.existsByCode(request.getCode())
+                                .flatMap(exists -> {
+                                    if (exists) {
+                                        return Mono.error(new CouponAlreadyExistsException(request.getCode()));
+                                    }
+                                    couponMapper.update(existingCoupon, request);
+                                    return couponRepository.save(existingCoupon)
+                                            .map(couponMapper::toCouponResponse);
+                                });
+                    }
+                    couponMapper.update(existingCoupon, request);
+                    return couponRepository.save(existingCoupon)
+                            .map(couponMapper::toCouponResponse);
+                });
     }
 
     public Mono<Void> deleteCoupon(Long id) {
-        return couponRepository.deleteById(id);
+        return couponRepository.existsById(id)
+                .flatMap(exists -> {
+                    if (!exists) {
+                        return Mono.error(new CouponNotFoundException(id));
+                    }
+                    return couponRepository.deleteById(id);
+                });
     }
 
     public Mono<CouponValidationResponse> validateCoupon(CouponValidationRequest request) {
         return couponRepository.findByCodeAndActiveTrue(request.getCouponCode())
-                .flatMap(coupon -> {
-                    String validationMessage = validateCoupon(coupon, request.getOrderAmount());
-                    if (validationMessage != null) {
-                        return Mono.just(CouponValidationResponse.builder()
-                                .valid(false)
-                                .message(validationMessage)
-                                .discountAmount(BigDecimal.ZERO)
-                                .finalAmount(request.getOrderAmount())
-                                .build());
-                    }
-
-                    BigDecimal discountAmount = calculateDiscount(coupon, request.getOrderAmount());
-                    BigDecimal finalAmount = request.getOrderAmount().subtract(discountAmount);
-
-                    return Mono.just(CouponValidationResponse.builder()
-                            .valid(true)
-                            .message("Coupon applied successfully")
-                            .discountAmount(discountAmount)
-                            .finalAmount(finalAmount.max(BigDecimal.ZERO))
-                            .build());
-                })
+                .flatMap(coupon -> validateAndCalculateDiscount(coupon, request.getOrderAmount()))
                 .switchIfEmpty(Mono.just(CouponValidationResponse.builder()
                         .valid(false)
                         .message("Invalid or inactive coupon code")
@@ -102,34 +96,30 @@ public class CouponService {
                         .build()));
     }
 
-//    public Mono<OrderCoupon> applyCouponToOrder(Long orderId, String couponCode, BigDecimal orderAmount) {
-//        return couponRepository.findByCodeAndActiveTrue(couponCode)
-//                .flatMap(coupon -> {
-//                    String validationMessage = validateCoupon(coupon, orderAmount);
-//                    if (validationMessage != null) {
-//                        return Mono.error(new RuntimeException(validationMessage));
-//                    }
-//
-//                    BigDecimal discountAmount = calculateDiscount(coupon, orderAmount);
-//
-//                    OrderCoupon orderCoupon = OrderCoupon.builder()
-//                            .orderId(orderId)
-//                            .couponId(coupon.getId())
-//                            .couponCode(coupon.getCode())
-//                            .couponType(coupon.getType())
-//                            .discountAmount(discountAmount)
-//                            .originalAmount(orderAmount)
-//                            .build();
-//
-//                    // Increment usage count
-//                    coupon.setUsageCount(coupon.getUsageCount() + 1);
-//                    return couponRepository.save(coupon)
-//                            .then(orderCouponRepository.save(orderCoupon));
-//                });
-//    }
-
     public Flux<OrderCoupon> getOrderCoupons(Long orderId) {
         return orderCouponRepository.findByOrderId(orderId);
+    }
+
+    private Mono<CouponValidationResponse> validateAndCalculateDiscount(Coupon coupon, BigDecimal orderAmount) {
+        String validationMessage = validateCoupon(coupon, orderAmount);
+        if (validationMessage != null) {
+            return Mono.just(CouponValidationResponse.builder()
+                    .valid(false)
+                    .message(validationMessage)
+                    .discountAmount(BigDecimal.ZERO)
+                    .finalAmount(orderAmount)
+                    .build());
+        }
+
+        BigDecimal discountAmount = calculateDiscount(coupon, orderAmount);
+        BigDecimal finalAmount = orderAmount.subtract(discountAmount).max(BigDecimal.ZERO);
+
+        return Mono.just(CouponValidationResponse.builder()
+                .valid(true)
+                .message("Coupon applied successfully")
+                .discountAmount(discountAmount)
+                .finalAmount(finalAmount)
+                .build());
     }
 
     private String validateCoupon(Coupon coupon, BigDecimal orderAmount) {
@@ -148,8 +138,7 @@ public class CouponService {
             return String.format("Minimum order amount of %s required", coupon.getMinimumOrderAmount());
         }
 
-        if (coupon.getMaxUsage() != null &&
-                coupon.getUsageCount() >= coupon.getMaxUsage()) {
+        if (coupon.getMaxUsage() != null && coupon.getUsageCount() >= coupon.getMaxUsage()) {
             return "Coupon usage limit exceeded";
         }
 
@@ -160,7 +149,7 @@ public class CouponService {
         return switch (coupon.getType()) {
             case PERCENTAGE -> orderAmount.multiply(coupon.getDiscountValue().divide(BigDecimal.valueOf(100)));
             case FIXED_AMOUNT -> coupon.getDiscountValue().min(orderAmount);
-            case FREE_SHIPPING -> BigDecimal.ZERO; // Handle shipping separately
+            case FREE_SHIPPING -> BigDecimal.ZERO;
         };
     }
 }

@@ -15,82 +15,54 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.cloud.stream.function.StreamBridge;
 import org.springframework.security.oauth2.core.oidc.StandardClaimNames;
 import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
-import org.springframework.stereotype.Service;
-import reactor.util.function.Tuple2;
-import reactor.util.function.Tuples;
-
-import java.math.BigDecimal;
 import java.util.List;
-
 
 @Service
 @RequiredArgsConstructor
 @FieldDefaults(level = AccessLevel.PRIVATE, makeFinal = true)
 @Slf4j
 public class OrderService {
-    private final CouponRepository couponRepository;
-    private final OrderItemRepository orderItemRepository;
+
+    CouponRepository couponRepository;
+    OrderItemRepository orderItemRepository;
     BookClient bookClient;
     InventoryClient inventoryClient;
     OrderMapper orderMapper;
-	OrderRepository orderRepository;
-	StreamBridge streamBridge;
+    OrderRepository orderRepository;
+    StreamBridge streamBridge;
     OrderCouponRepository orderCouponRepository;
 
-	public Flux<OrderResponse> getAllOrders() {
-		return orderRepository.findAll()
+    public Flux<OrderResponse> getAllOrders() {
+        return orderRepository.findAll()
                 .map(orderMapper::toOrderResponse)
-                .flatMap(orderResponse ->
-                        orderItemRepository.findAllByOrderId(orderResponse.getId())
-                                .collectList()
-                                .map(orderItems -> {
-                                    orderResponse.setOrderItems(orderItems);
-                                    return orderResponse;
-                                }))
-                .flatMap(orderResponse ->
-                        orderCouponRepository.findByOrderId(orderResponse.getId())
-                                .map(OrderCoupon::getCouponId)
-                                .flatMap(couponRepository::findById)
-                                .collectList()
-                                .map(coupons -> {
-                                    orderResponse.setCoupons(coupons);
-                                    return orderResponse;
-                                }));
-	}
+                .flatMap(this::enrichOrderWithItems)
+                .flatMap(this::enrichOrderWithCoupons);
+    }
 
     public Flux<OrderResponse> getMyOrders(String userId) {
         return orderRepository.findByCreatedBy(userId)
                 .map(orderMapper::toOrderResponse)
-                .flatMap(orderResponse ->
-                        orderItemRepository.findAllByOrderId(orderResponse.getId())
-                                .collectList()
-                                .map(orderItems -> {
-                                    orderResponse.setOrderItems(orderItems);
-                                    return orderResponse;
-                                }));
+                .flatMap(this::enrichOrderWithItems);
     }
 
     public Mono<OrderResponse> getOrderById(Long orderId) {
         return orderRepository.findById(orderId)
+                .switchIfEmpty(Mono.error(new OrderNotFoundException(orderId)))
                 .map(orderMapper::toOrderResponse)
-                .flatMap(orderResponse ->
-                        orderItemRepository.findAllByOrderId(orderResponse.getId())
-                                .collectList()
-                                .map(orderItems -> {
-                                    orderResponse.setOrderItems(orderItems);
-                                    return orderResponse;
-                                }));
+                .flatMap(this::enrichOrderWithItems);
     }
 
     @Transactional
     public Mono<OrderResponse> submitOrder(OrderRequest request, Jwt jwt) {
-        return validateAndUpdateInventory(request)
-                .collectList()
-                .then(createAndSaveOrder(request, jwt))
+        return createAndSaveOrder(request, jwt)
+                .flatMap(order -> validateAndUpdateInventory(request)
+                        .collectList()
+                        .thenReturn(order))
                 .doOnNext(this::publishOrderEvent)
                 .flatMap(this::enrichOrderResponse);
     }
@@ -102,14 +74,15 @@ public class OrderService {
 
     private Mono<BookTypeResponse> validateAndUpdateItemInventory(OrderItem item) {
         return inventoryClient.getInventoryItem(item.getBookId(), item.getTypeId())
+                .switchIfEmpty(Mono.error(new InventoryNotFoundException(item.getBookId(), item.getTypeId())))
                 .flatMap(inventory -> validateStock(item, inventory))
                 .flatMap(inventory -> updateInventory(item, inventory))
-                .doOnNext(res -> log.info(res.toString()));
+                .doOnNext(response -> log.info("Updated inventory: {}", response));
     }
 
     private Mono<BookTypeResponse> validateStock(OrderItem item, BookTypeResponse inventory) {
         if (inventory.getQuantity() < item.getQuantity()) {
-            return Mono.error(createInsufficientStockException(item, inventory));
+            return Mono.error(new InsufficientStockException(item.getBookId(), item.getTypeId(), item.getQuantity(), inventory.getQuantity()));
         }
         return Mono.just(inventory);
     }
@@ -121,15 +94,7 @@ public class OrderService {
                 .build();
 
         return inventoryClient.updateInventory(item.getBookId(), item.getTypeId(), updateRequest)
-                .doOnNext(response -> log.info(response.toString()));
-    }
-
-    private RuntimeException createInsufficientStockException(OrderItem item, BookTypeResponse inventory) {
-        String errorMessage = String.format(
-                "Insufficient stock for Book ID: %d, Type ID: %d. Requested: %d, Available: %d",
-                item.getBookId(), item.getTypeId(), item.getQuantity(), inventory.getQuantity()
-        );
-        return new RuntimeException(errorMessage);
+                .doOnNext(response -> log.info("Inventory update response: {}", response));
     }
 
     private Mono<Order> createAndSaveOrder(OrderRequest request, Jwt jwt) {
@@ -139,10 +104,9 @@ public class OrderService {
     }
 
     private Mono<Order> saveOrderDetails(Order order, OrderRequest request) {
-        Mono<Void> saveItems = saveOrderItems(order, request.getOrderItems());
-        Mono<Void> saveCoupons = saveOrderCoupons(order, request.getCoupons());
-
-        return saveItems.then(saveCoupons).thenReturn(order);
+        return saveOrderItems(order, request.getOrderItems())
+                .then(saveOrderCoupons(order, request.getCoupons()))
+                .thenReturn(order);
     }
 
     private Mono<OrderResponse> enrichOrderResponse(Order order) {
@@ -155,20 +119,42 @@ public class OrderService {
                 });
     }
 
+    private Mono<OrderResponse> enrichOrderWithItems(OrderResponse orderResponse) {
+        return orderItemRepository.findAllByOrderId(orderResponse.getId())
+                .collectList()
+                .map(items -> {
+                    orderResponse.setOrderItems(items);
+                    return orderResponse;
+                });
+    }
+
+    private Mono<OrderResponse> enrichOrderWithCoupons(OrderResponse orderResponse) {
+        return orderCouponRepository.findByOrderId(orderResponse.getId())
+                .map(OrderCoupon::getCouponId)
+                .flatMap(couponRepository::findById)
+                .collectList()
+                .map(coupons -> {
+                    orderResponse.setCoupons(coupons);
+                    return orderResponse;
+                });
+    }
+
     @Transactional
     public Mono<Void> deleteOrder(Long orderId, String userId) {
         return orderRepository.existsByIdAndCreatedBy(orderId, userId)
                 .flatMap(exists -> {
                     if (!exists) {
-                        return Mono.error(new RuntimeException("Order not found or access denied"));
+                        return Mono.error(new OrderAccessDeniedException(orderId, userId));
                     }
                     return orderItemRepository.deleteAllByOrderId(orderId)
+                            .then(orderCouponRepository.deleteAllByOrderId(orderId))
                             .then(orderRepository.deleteById(orderId));
                 });
     }
 
     public Mono<Order> updateOrder(Long orderId, OrderUpdateRequest request) {
         return orderRepository.findById(orderId)
+                .switchIfEmpty(Mono.error(new OrderNotFoundException(orderId)))
                 .map(order -> {
                     orderMapper.updateOrder(order, request);
                     return order;
@@ -179,8 +165,8 @@ public class OrderService {
 
     public Flux<Order> consumeExchangeEvent(Flux<ExchangeEvent> flux) {
         return flux
-                .flatMap(event -> orderRepository.findById(event.getOrderId()))
-                .switchIfEmpty(Mono.error(new RuntimeException("order not found")))
+                .flatMap(event -> orderRepository.findById(event.getOrderId())
+                        .switchIfEmpty(Mono.error(new OrderNotFoundException(event.getOrderId()))))
                 .map(order -> {
                     order.setStatus(OrderStatus.PAID);
                     order.setExchange(true);
@@ -191,29 +177,27 @@ public class OrderService {
     }
 
     public Flux<Order> consumeDeliveryEvent(Flux<DeliveryEvent> flux) {
-		return flux
-                .flatMap(event -> {
-                    return orderRepository.findById(event.getOrderId())
-                            .map(order -> switch (event.getStatus()) {
-                                case DeliveryStatus.SHIPPED -> completeOrder(order);
-                                case DeliveryStatus.CANCELLED -> cancelOrder(order);
-                                case DeliveryStatus.ASSIGNED -> shipOrder(order);
-                                default -> order;
-                            });
-                })
+        return flux
+                .flatMap(event -> orderRepository.findById(event.getOrderId())
+                        .switchIfEmpty(Mono.error(new OrderNotFoundException(event.getOrderId())))
+                        .map(order -> switch (event.getStatus()) {
+                            case DeliveryStatus.SHIPPED -> completeOrder(order);
+                            case DeliveryStatus.CANCELLED -> cancelOrder(order);
+                            case DeliveryStatus.ASSIGNED -> shipOrder(order);
+                            default -> order;
+                        }))
                 .flatMap(orderRepository::save);
-	}
+    }
 
     public Flux<Order> consumePaymentEvent(Flux<PaymentEvent> flux) {
         return flux
-                .flatMap(event ->
-                        orderRepository.findById(event.getOrderId())
-                            .map(order -> switch (event.getStatus()) {
-                                case PaymentStatus.CANCELLED -> cancelOrder(order);
-                                case PaymentStatus.COMPLETED -> paidOrder(order);
-                                default -> order;
-                            })
-                )
+                .flatMap(event -> orderRepository.findById(event.getOrderId())
+                        .switchIfEmpty(Mono.error(new OrderNotFoundException(event.getOrderId())))
+                        .map(order -> switch (event.getStatus()) {
+                            case PaymentStatus.CANCELLED -> cancelOrder(order);
+                            case PaymentStatus.COMPLETED -> paidOrder(order);
+                            default -> order;
+                        }))
                 .flatMap(orderRepository::save);
     }
 
@@ -225,38 +209,38 @@ public class OrderService {
 
     private Mono<Void> saveOrderItems(Order order, List<OrderItem> orderItems) {
         return Flux.fromIterable(orderItems)
-                .flatMap(item -> {
-                    return bookClient.getBookById(item.getBookId())
-                            .switchIfEmpty(Mono.error(new RuntimeException()))
-                            .map(book -> {
-                                item.setOrderId(order.getId());
-                                item.setBookId(book.getId());
-                                item.setIsbn(book.getIsbn());
-                                item.setTitle(book.getTitle());
-                                item.setPrice(book.getPrice());
-                                item.setAuthor(book.getAuthor());
-                                item.setPublisher(book.getPublisher());
-                                return item;
-                            });
-                })
+                .flatMap(item -> bookClient.getBookById(item.getBookId())
+                        .switchIfEmpty(Mono.error(new BookNotFoundException(item.getBookId())))
+                        .map(book -> {
+                            item.setOrderId(order.getId());
+                            item.setBookId(book.getId());
+                            item.setIsbn(book.getIsbn());
+                            item.setTitle(book.getTitle());
+                            item.setPrice(book.getPrice());
+                            item.setAuthor(book.getAuthor());
+                            item.setPublisher(book.getPublisher());
+                            return item;
+                        }))
                 .flatMap(orderItemRepository::save)
                 .then();
     }
 
     private Mono<Void> saveOrderCoupons(Order order, List<String> coupons) {
         return Flux.fromIterable(coupons)
-                .flatMap(item -> {
-                    return couponRepository.findById(Long.parseLong(item))
-                            .switchIfEmpty(Mono.error(new RuntimeException()))
-                            .map(coupon -> {
-                                return OrderCoupon.builder()
-                                        .orderId(order.getId())
-                                        .couponId(coupon.getId())
-                                        .build();
-                            });
-                })
+                .flatMap(couponId -> couponRepository.findById(Long.parseLong(couponId))
+                        .switchIfEmpty(Mono.error(new CouponNotFoundException(Long.parseLong(couponId))))
+                        .flatMap(coupon -> updateCouponCount(coupon))
+                        .map(coupon -> OrderCoupon.builder()
+                                .orderId(order.getId())
+                                .couponId(coupon.getId())
+                                .build()))
                 .flatMap(orderCouponRepository::save)
                 .then();
+    }
+
+    private Mono<Coupon> updateCouponCount(Coupon coupon) {
+        coupon.setUsageCount(coupon.getUsageCount() + 1);
+        return couponRepository.save(coupon);
     }
 
     private Order buildAcceptedOrder(OrderRequest request, Jwt jwt) {
@@ -274,7 +258,6 @@ public class OrderService {
     private Order completeOrder(Order order) {
         order.setStatus(OrderStatus.COMPLETED);
         return order;
-
     }
 
     private Order cancelOrder(Order order) {
