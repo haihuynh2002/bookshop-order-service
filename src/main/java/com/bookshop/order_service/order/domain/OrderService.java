@@ -166,12 +166,10 @@ public class OrderService {
     public Flux<Order> consumeExchangeEvent(Flux<ExchangeEvent> flux) {
         return flux
                 .flatMap(event -> orderRepository.findById(event.getOrderId())
-                        .switchIfEmpty(Mono.error(new OrderNotFoundException(event.getOrderId()))))
-                .map(order -> {
-                    order.setStatus(OrderStatus.PAID);
-                    order.setExchange(true);
-                    return order;
-                })
+                .map(order -> switch (event.getStatus()) {
+                    case ExchangeStatus.APPROVED -> exchangeOrder(order);
+                    default -> order;
+                }))
                 .flatMap(orderRepository::save)
                 .doOnNext(this::publishOrderEvent);
     }
@@ -179,7 +177,6 @@ public class OrderService {
     public Flux<Order> consumeDeliveryEvent(Flux<DeliveryEvent> flux) {
         return flux
                 .flatMap(event -> orderRepository.findById(event.getOrderId())
-                        .switchIfEmpty(Mono.error(new OrderNotFoundException(event.getOrderId())))
                         .map(order -> switch (event.getStatus()) {
                             case DeliveryStatus.SHIPPED -> completeOrder(order);
                             case DeliveryStatus.CANCELLED -> cancelOrder(order);
@@ -192,7 +189,6 @@ public class OrderService {
     public Flux<Order> consumePaymentEvent(Flux<PaymentEvent> flux) {
         return flux
                 .flatMap(event -> orderRepository.findById(event.getOrderId())
-                        .switchIfEmpty(Mono.error(new OrderNotFoundException(event.getOrderId())))
                         .map(order -> switch (event.getStatus()) {
                             case PaymentStatus.CANCELLED -> cancelOrder(order);
                             case PaymentStatus.COMPLETED -> paidOrder(order);
@@ -261,7 +257,12 @@ public class OrderService {
     }
 
     private Order cancelOrder(Order order) {
-        order.setStatus(OrderStatus.CANCELLED);
+        if(order.getExchange()) {
+            order.setStatus(OrderStatus.COMPLETED);
+            order.setExchange(false);
+        } else {
+            order.setStatus(OrderStatus.CANCELLED);
+        }
         return order;
     }
 
@@ -272,6 +273,12 @@ public class OrderService {
 
     private Order shipOrder(Order order) {
         order.setStatus(OrderStatus.SHIPPING);
+        return order;
+    }
+
+    private Order exchangeOrder(Order order) {
+        order.setStatus(OrderStatus.PAID);
+        order.setExchange(true);
         return order;
     }
 }
