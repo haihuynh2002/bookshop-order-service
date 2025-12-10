@@ -44,6 +44,14 @@ public class GlobalControllerAdvice {
                 .build());
     }
 
+    @ExceptionHandler(IllegalStateException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public Mono<ErrorResponse> handleIllegalStateException(Exception ex) {
+        return Mono.just(ErrorResponse.builder()
+                .message(ex.getMessage())
+                .build());
+    }
+
     @ExceptionHandler(Exception.class)
     @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
     public Mono<ErrorResponse> handleGenericException(Exception ex) {

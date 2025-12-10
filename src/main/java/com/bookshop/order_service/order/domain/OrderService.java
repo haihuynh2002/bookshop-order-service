@@ -155,12 +155,19 @@ public class OrderService {
     public Mono<Order> updateOrder(Long orderId, OrderUpdateRequest request) {
         return orderRepository.findById(orderId)
                 .switchIfEmpty(Mono.error(new OrderNotFoundException(orderId)))
+                .flatMap(this::validateOrderStatus)
                 .map(order -> {
                     orderMapper.updateOrder(order, request);
                     return order;
                 })
                 .flatMap(orderRepository::save)
                 .doOnNext(this::publishOrderEvent);
+    }
+
+    private Mono<Order> validateOrderStatus(Order order) {
+        return order.getStatus().equals(OrderStatus.SHIPPING)
+                ? Mono.error(new IllegalStateException("Cannot update order with shipping status"))
+                : Mono.just(order);
     }
 
     public Flux<Order> consumeExchangeEvent(Flux<ExchangeEvent> flux) {
